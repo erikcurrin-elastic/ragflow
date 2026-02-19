@@ -25,7 +25,7 @@ from common.decorator import singleton
 from common.doc_store.doc_store_base import MatchTextExpr, OrderByExpr, MatchExpr, MatchDenseExpr, FusionExpr
 from common.doc_store.es_conn_base import ESConnectionBase
 from common.float_utils import get_float
-from common.constants import PAGERANK_FLD, TAG_FLD
+from rag.utils.es_retriever_body import build_retriever_body, rank_feature_field_name
 
 ATTEMPT_TIME = 2
 
@@ -77,16 +77,55 @@ class ESConnection(ESConnectionBase):
                 raise Exception(
                     f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
 
-        s = Search()
+        # We have text only expressions, vector expressions, and hybrid (both)... separate them
+        match_text_exprs = [m for m in match_expressions if isinstance(m, MatchTextExpr)]
+        match_dense_exprs = [m for m in match_expressions if isinstance(m, MatchDenseExpr)]
+        fusion_exprs = [m for m in match_expressions if isinstance(m, FusionExpr)]
+        has_text = len(match_text_exprs) > 0
+        has_dense = len(match_dense_exprs) > 0
+
         vector_similarity_weight = 0.5
-        for m in match_expressions:
+        for m in fusion_exprs:
             if isinstance(m, FusionExpr) and m.method == "weighted_sum" and "weights" in m.fusion_params:
-                assert len(match_expressions) == 3 and isinstance(match_expressions[0], MatchTextExpr) and isinstance(
-                    match_expressions[1],
-                    MatchDenseExpr) and isinstance(
-                    match_expressions[2], FusionExpr)
                 weights = m.fusion_params["weights"]
                 vector_similarity_weight = get_float(weights.split(",")[1])
+                break
+
+        # Option A: Hybrid via Elasticsearch retriever API (RRF/linear) when both text and vector exist (assumes ES 8.14+)
+        if has_text and has_dense:
+            # Today, the retriever expects and supports exactly one text and one dense clause, so if we find
+            # more than that, we will fall through to the non-retriever case
+            if len(match_text_exprs) == 1 and len(match_dense_exprs) == 1:
+                match_text = match_text_exprs[0]
+                match_dense = match_dense_exprs[0]
+                try:
+                    res = self._search_retriever(
+                        match_text=match_text,
+                        match_dense=match_dense,
+                        bool_query=bool_query,
+                        vector_similarity_weight=vector_similarity_weight,
+                        rank_feature=rank_feature,
+                        index_names=index_names,
+                        highlight_fields=highlight_fields,
+                        order_by=order_by,
+                        offset=offset,
+                        limit=limit,
+                        agg_fields=agg_fields,
+                    )
+                    return res
+                except Exception as e:
+                    # The error may be in the version, so try the fallback path
+                    if "retriever" in str(e).lower() or "parse" in str(e).lower():
+                        self.logger.warning(
+                            "ES retriever API failed (cluster may be < 8.14), falling back to legacy hybrid: %s",
+                            e,
+                        )
+                        # Fall through to legacy Search() below
+                    else:
+                        raise
+
+        # Option B / legacy: build Search with query and/or kNN
+        s = Search()
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
@@ -99,7 +138,6 @@ class ESConnection(ESConnectionBase):
                 bool_query.boost = 1.0 - vector_similarity_weight
 
             elif isinstance(m, MatchDenseExpr):
-                assert (bool_query is not None)
                 similarity = 0.0
                 if "similarity" in m.extra_options:
                     similarity = m.extra_options["similarity"]
@@ -113,9 +151,8 @@ class ESConnection(ESConnectionBase):
 
         if bool_query and rank_feature:
             for fld, sc in rank_feature.items():
-                if fld != PAGERANK_FLD:
-                    fld = f"{TAG_FLD}.{fld}"
-                bool_query.should.append(Q("rank_feature", field=fld, linear={}, boost=sc))
+                field_name = rank_feature_field_name(fld)
+                bool_query.should.append(Q("rank_feature", field=field_name, linear={}, boost=sc))
 
         if bool_query:
             s = s.query(bool_query)
@@ -162,7 +199,6 @@ class ESConnection(ESConnectionBase):
                 self._connect()
                 continue
             except Exception as e:
-                # Only log debug for NotFoundError(accepted when metadata index doesn't exist)
                 if 'NotFound' in str(e):
                     self.logger.debug(f"ESConnection.search {str(index_names)} query: " + str(q) + " - " + str(e))
                 else:
@@ -171,6 +207,50 @@ class ESConnection(ESConnectionBase):
 
         self.logger.error(f"ESConnection.search timeout for {ATTEMPT_TIME} times!")
         raise Exception("ESConnection.search timeout.")
+
+    def _search_retriever(
+        self,
+        match_text: MatchTextExpr,
+        match_dense: MatchDenseExpr,
+        bool_query: Q,
+        vector_similarity_weight: float,
+        rank_feature: dict | None,
+        index_names: list[str],
+        highlight_fields: list[str],
+        order_by: OrderByExpr,
+        offset: int,
+        limit: int,
+        agg_fields: list[str] | None,
+    ):
+        """Execute hybrid search using Elasticsearch retriever API (RRF or linear). ES 8.14+."""
+        body = build_retriever_body(
+            match_text=match_text,
+            match_dense=match_dense,
+            bool_query=bool_query,
+            vector_similarity_weight=vector_similarity_weight,
+            offset=offset,
+            limit=limit,
+            highlight_fields=highlight_fields,
+            order_by=order_by,
+            agg_fields=agg_fields,
+            rank_feature=rank_feature,
+        )
+        self.logger.debug("ESConnection.search retriever body: %s", json.dumps(body))
+        for i in range(ATTEMPT_TIME):
+            try:
+                res = self.es.search(
+                    index=index_names,
+                    body=body,
+                    timeout="600s",
+                )
+                if str(res.get("timed_out", "")).lower() == "true":
+                    raise Exception("Es Timeout.")
+                return res
+            except ConnectionTimeout:
+                self.logger.exception("ES request timeout")
+                self._connect()
+                continue
+        raise Exception("ESConnection.search retriever timeout.")
 
     def insert(self, documents: list[dict], index_name: str, knowledgebase_id: str = None) -> list[str]:
         # Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
